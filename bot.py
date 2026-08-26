@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import threading
@@ -46,15 +47,31 @@ logging.basicConfig(
 )
 
 
-def is_valid_ticker(ticker: str) -> bool:
-    """Verifies if the ticker exists and returns price data on Yahoo Finance."""
+def fetch_stock_price_sync(ticker: str):
+    """Synchronous worker function to fetch stock price via yfinance."""
     try:
         stock = yf.Ticker(ticker)
-        # Check fast_info first, then fallback to recent history
+        data = stock.history(period="1d", interval="1m")
+        if not data.empty:
+            return ticker, data["Close"].iloc[-1]
+    except Exception as e:
+        logging.error(f"Error fetching price for {ticker}: {e}")
+    return ticker, None
+
+
+async def fetch_stock_price_async(ticker: str):
+    """Executes the synchronous yfinance call asynchronously in a thread executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fetch_stock_price_sync, ticker)
+
+
+def is_valid_ticker_sync(ticker: str) -> bool:
+    """Synchronous worker to validate ticker existence."""
+    try:
+        stock = yf.Ticker(ticker)
         price = stock.fast_info.get("lastPrice")
         if price is not None:
             return True
-
         hist = stock.history(period="1d")
         return not hist.empty
     except Exception as e:
@@ -89,11 +106,15 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (ticker.endswith(".NS") or ticker.endswith(".BO")):
             ticker += ".NS"
 
-        # Notify user that validation is in progress
         await update.message.reply_text(f"Checking ticker {ticker}...")
 
-        # Validate if stock exists
-        if not is_valid_ticker(ticker):
+        # Non-blocking ticker validation
+        loop = asyncio.get_running_loop()
+        valid = await loop.run_in_executor(
+            None, is_valid_ticker_sync, ticker
+        )
+
+        if not valid:
             await update.message.reply_text(
                 f"Invalid ticker: {ticker}.\nPlease check the symbol and exchange suffix (.NS for NSE, .BO for BSE)."
             )
@@ -136,17 +157,14 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target = context.args[0].upper()
 
-    # Clear all alerts
     if target == "ALL":
         alerts.clear()
         await update.message.reply_text("All active alerts cleared!")
         return
 
-    # Append default NSE suffix if missing
     if not (target.endswith(".NS") or target.endswith(".BO")):
         target += ".NS"
 
-    # Delete individual alert
     if target in alerts:
         del alerts[target]
         await update.message.reply_text(f"Alert for {target} removed.")
@@ -157,16 +175,18 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_prices(context: ContextTypes.DEFAULT_TYPE):
-    """Checks active alerts against current market price every 60s."""
-    triggered = []
-    for ticker, target_price in list(alerts.items()):
-        try:
-            stock = yf.Ticker(ticker)
-            data = stock.history(period="1d", interval="1m")
-            if data.empty:
-                continue
+    """Checks ALL active stock alerts concurrently in parallel every 10 seconds."""
+    if not alerts:
+        return
 
-            current_price = data["Close"].iloc[-1]
+    # Create concurrent tasks for all active tickers
+    tasks = [fetch_stock_price_async(ticker) for ticker in list(alerts.keys())]
+    results = await asyncio.gather(*tasks)
+
+    triggered = []
+    for ticker, current_price in results:
+        if current_price is not None and ticker in alerts:
+            target_price = alerts[ticker]
             if current_price >= target_price:
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
@@ -178,11 +198,10 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
                     ),
                 )
                 triggered.append(ticker)
-        except Exception as e:
-            logging.error(f"Error checking {ticker}: {e}")
 
+    # Clean up triggered alerts
     for ticker in triggered:
-        del alerts[ticker]
+        alerts.pop(ticker, None)
 
 
 def main():
@@ -196,11 +215,11 @@ def main():
     bot_app.add_handler(CommandHandler("list", list_command))
     bot_app.add_handler(CommandHandler("delete", delete_command))
 
-    # Price checking job every 60s
+    # Fast check interval: Runs every 10 seconds in parallel
     job_queue = bot_app.job_queue
-    job_queue.run_repeating(check_prices, interval=60, first=10)
+    job_queue.run_repeating(check_prices, interval=10, first=5)
 
-    print("Bot started successfully...")
+    print("Bot started successfully with 10s parallel checking...")
     bot_app.run_polling()
 
 
