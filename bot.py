@@ -7,20 +7,16 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import yfinance as yf
 
-# Load local .env file if available
+# Load local environment variables from .env if present
 load_dotenv()
 
-# Fetch credentials from environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Ensure required credentials exist before continuing
 if not BOT_TOKEN or not CHAT_ID:
-    raise ValueError(
-        "Missing environment variables! Please set BOT_TOKEN and CHAT_ID."
-    )
+    raise ValueError("Missing BOT_TOKEN or CHAT_ID environment variables!")
 
-# --- 1. KEEP-ALIVE WEB SERVER FOR FREE HOSTING ---
+# --- FLASK SERVER (Prevents Free Hosting Sleep) ---
 app = Flask(__name__)
 
 
@@ -40,8 +36,8 @@ def keep_alive():
     t.start()
 
 
-# --- 2. BOT LOGIC & DICTIONARY STORAGE ---
-# Dictionary to store active alerts: { ticker: target_price }
+# --- TELEGRAM BOT LOGIC ---
+# Active alerts storage: { ticker: target_price }
 alerts = {}
 
 logging.basicConfig(
@@ -50,41 +46,119 @@ logging.basicConfig(
 )
 
 
+def is_valid_ticker(ticker: str) -> bool:
+    """Verifies if the ticker exists and returns price data on Yahoo Finance."""
+    try:
+        stock = yf.Ticker(ticker)
+        # Check fast_info first, then fallback to recent history
+        price = stock.fast_info.get("lastPrice")
+        if price is not None:
+            return True
+
+        hist = stock.history(period="1d")
+        return not hist.empty
+    except Exception as e:
+        logging.error(f"Error validating ticker {ticker}: {e}")
+        return False
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays welcome message and available commands."""
+    msg = (
+        "Welcome to Stock Price Alert Bot!\n\n"
+        "I monitor Indian stocks (NSE/BSE) and notify you when targets are hit.\n\n"
+        "Commands:\n"
+        "- /start - Show this help menu\n"
+        "- /alert <TICKER> <PRICE> - Set a new price alert\n"
+        "- /list - View all active alerts\n"
+        "- /delete <TICKER> - Cancel an alert for a specific ticker\n"
+        "- /delete ALL - Clear all active alerts\n\n"
+        "Examples:\n"
+        "- Set alert: /alert RELIANCE 2900 or /alert TCS.BO 4100\n"
+        "- Delete alert: /delete RELIANCE.NS or /delete ALL"
+    )
+    await update.message.reply_text(msg)
+
+
 async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Usage:
-    /alert RELIANCE 2900
-    /alert TATAMOTORS.NS 950
-    /alert TCS.BO 4100
-    """
+    """Validates ticker existence and sets a price alert."""
     try:
         ticker = context.args[0].upper()
         target_price = float(context.args[1])
 
-        # Append default NSE suffix (.NS) if exchange suffix is omitted
         if not (ticker.endswith(".NS") or ticker.endswith(".BO")):
             ticker += ".NS"
 
+        # Notify user that validation is in progress
+        await update.message.reply_text(f"Checking ticker {ticker}...")
+
+        # Validate if stock exists
+        if not is_valid_ticker(ticker):
+            await update.message.reply_text(
+                f"Invalid ticker: {ticker}.\nPlease check the symbol and exchange suffix (.NS for NSE, .BO for BSE)."
+            )
+            return
+
         alerts[ticker] = target_price
         await update.message.reply_text(
-            f"✅ Alert set for **{ticker}** at **₹{target_price}**.\n"
-            "I will notify you when it reaches or crosses this target!",
-            parse_mode="Markdown",
+            f"Alert set for {ticker} at Rs. {target_price:.2f}."
         )
     except (IndexError, ValueError):
         await update.message.reply_text(
-            "❌ Invalid format!\n\n"
-            "Usage: `/alert <TICKER> <TARGET_PRICE>`\n"
-            "NSE Example: `/alert RELIANCE 2900`\n"
-            "BSE Example: `/alert TCS.BO 4100`",
-            parse_mode="Markdown",
+            "Invalid Format!\nUsage: /alert <TICKER> <PRICE>\n"
+            "Example: /alert RELIANCE 2900"
+        )
+
+
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists all current active price alerts."""
+    if not alerts:
+        await update.message.reply_text("You have no active stock alerts.")
+        return
+
+    msg = "Your Active Price Alerts:\n\n"
+    for ticker, price in alerts.items():
+        msg += f"- {ticker}: Rs. {price:.2f}\n"
+
+    msg += "\nUse /delete <TICKER> or /delete ALL to manage alerts."
+    await update.message.reply_text(msg)
+
+
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deletes an individual alert or clears all alerts."""
+    if not context.args:
+        await update.message.reply_text(
+            "Missing argument!\n"
+            "Usage: /delete <TICKER> or /delete ALL\n"
+            "Example: /delete RELIANCE.NS"
+        )
+        return
+
+    target = context.args[0].upper()
+
+    # Clear all alerts
+    if target == "ALL":
+        alerts.clear()
+        await update.message.reply_text("All active alerts cleared!")
+        return
+
+    # Append default NSE suffix if missing
+    if not (target.endswith(".NS") or target.endswith(".BO")):
+        target += ".NS"
+
+    # Delete individual alert
+    if target in alerts:
+        del alerts[target]
+        await update.message.reply_text(f"Alert for {target} removed.")
+    else:
+        await update.message.reply_text(
+            f"No active alert found for {target}.\nUse /list to check active tickers."
         )
 
 
 async def check_prices(context: ContextTypes.DEFAULT_TYPE):
-    """Runs every 60 seconds to check stock prices against target alerts."""
+    """Checks active alerts against current market price every 60s."""
     triggered = []
-
     for ticker, target_price in list(alerts.items()):
         try:
             stock = yf.Ticker(ticker)
@@ -93,39 +167,40 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             current_price = data["Close"].iloc[-1]
-
-            # Trigger alert if current price reaches or exceeds target price
             if current_price >= target_price:
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f"🚨 **PRICE ALERT!** 🚨\n\n"
-                    f"**{ticker}** reached your target!\n"
-                    f"📈 **Current Price:** ₹{current_price:.2f}\n"
-                    f"🎯 **Target Price:** ₹{target_price:.2f}",
-                    parse_mode="Markdown",
+                    text=(
+                        f"PRICE ALERT!\n\n"
+                        f"{ticker} reached target!\n"
+                        f"Current Price: Rs. {current_price:.2f}\n"
+                        f"Target Price: Rs. {target_price:.2f}"
+                    ),
                 )
                 triggered.append(ticker)
         except Exception as e:
-            logging.error(f"Error fetching price for {ticker}: {e}")
+            logging.error(f"Error checking {ticker}: {e}")
 
-    # Remove triggered alerts
     for ticker in triggered:
         del alerts[ticker]
 
 
 def main():
-    # Start the Flask web server thread
     keep_alive()
 
-    # Initialize Telegram Bot
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("alert", alert_command))
 
-    # Schedule price checks every 60 seconds
+    # Command Handlers
+    bot_app.add_handler(CommandHandler("start", start_command))
+    bot_app.add_handler(CommandHandler("alert", alert_command))
+    bot_app.add_handler(CommandHandler("list", list_command))
+    bot_app.add_handler(CommandHandler("delete", delete_command))
+
+    # Price checking job every 60s
     job_queue = bot_app.job_queue
     job_queue.run_repeating(check_prices, interval=60, first=10)
 
-    print("Stock Alert Bot is running...")
+    print("Bot started successfully...")
     bot_app.run_polling()
 
 
