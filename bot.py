@@ -1,35 +1,44 @@
 import asyncio
 import logging
 import os
-import sqlite3
 import threading
 from dotenv import load_dotenv
 from flask import Flask
+import sqlitecloud
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import yfinance as yf
 
+# Load environment variables
 load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+SQLITE_CLOUD_URL = os.environ.get("SQLITE_CLOUD_URL")
 
-if not BOT_TOKEN or not CHAT_ID:
-    raise ValueError("Missing BOT_TOKEN or CHAT_ID environment variables!")
+if not BOT_TOKEN or not CHAT_ID or not SQLITE_CLOUD_URL:
+    raise ValueError(
+        "Missing BOT_TOKEN, CHAT_ID, or SQLITE_CLOUD_URL environment variable!"
+    )
 
-# --- 1. SQLITE DATABASE SETUP ---
-DB_NAME = "alerts.db"
+# --- 1. CLOUD DATABASE FUNCTIONS ---
+
+
+def get_db_connection():
+    """Establishes connection to SQLite Cloud."""
+    return sqlitecloud.connect(SQLITE_CLOUD_URL)
 
 
 def init_db():
-    """Creates the alerts table if it doesn't already exist."""
-    conn = sqlite3.connect(DB_NAME)
+    """Initializes table with an AUTOINCREMENT ID to allow multiple alerts for the same stock."""
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS alerts (
-            ticker TEXT PRIMARY KEY,
-            target_price REAL
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            target_price REAL NOT NULL
         )
     """
     )
@@ -38,30 +47,39 @@ def init_db():
 
 
 def save_alert(ticker: str, price: float):
-    """Saves or updates an alert in the database."""
-    conn = sqlite3.connect(DB_NAME)
+    """Inserts a new alert into the cloud database."""
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT OR REPLACE INTO alerts (ticker, target_price) VALUES (?, ?)",
+        "INSERT INTO alerts (ticker, target_price) VALUES (?, ?)",
         (ticker, price),
     )
     conn.commit()
     conn.close()
 
 
-def get_all_alerts() -> dict:
-    """Retrieves all active alerts from the database."""
-    conn = sqlite3.connect(DB_NAME)
+def get_all_alerts() -> list:
+    """Retrieves all active alerts [(id, ticker, target_price), ...]."""
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT ticker, target_price FROM alerts")
+    cursor.execute("SELECT id, ticker, target_price FROM alerts")
     rows = cursor.fetchall()
     conn.close()
-    return {row[0]: row[1] for row in rows}
+    return rows
 
 
-def delete_alert_db(ticker: str):
-    """Deletes a single alert from the database."""
-    conn = sqlite3.connect(DB_NAME)
+def delete_alert_by_id(alert_id: int):
+    """Deletes a specific alert by ID."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_alerts_by_ticker(ticker: str):
+    """Deletes all alerts matching a ticker."""
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM alerts WHERE ticker = ?", (ticker,))
     conn.commit()
@@ -69,8 +87,8 @@ def delete_alert_db(ticker: str):
 
 
 def clear_all_alerts_db():
-    """Clears all alerts from the database."""
-    conn = sqlite3.connect(DB_NAME)
+    """Clears all alerts from the cloud database."""
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM alerts")
     conn.commit()
@@ -139,12 +157,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "- /start - Show this help menu\n"
         "- /alert <TICKER> <PRICE> - Set a new price alert\n"
-        "- /list - View all active alerts\n"
-        "- /delete <TICKER> - Cancel an alert\n"
-        "- /delete ALL - Clear all alerts\n\n"
+        "- /list - View all active alerts with IDs\n"
+        "- /delete <ID or TICKER> - Cancel a specific alert ID or all alerts for a ticker\n"
+        "- /delete ALL - Clear all active alerts\n\n"
         "Examples:\n"
         "- /alert RELIANCE 2900\n"
-        "- /delete RELIANCE.NS"
+        "- /alert RELIANCE 3000\n"
+        "- /delete 2 (deletes alert #2)\n"
+        "- /delete RELIANCE.NS (deletes all RELIANCE alerts)"
     )
     await update.message.reply_text(msg)
 
@@ -168,7 +188,7 @@ async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Invalid ticker: {ticker}.")
             return
 
-        # Save directly to database
+        # Save to SQLite Cloud
         save_alert(ticker, target_price)
         await update.message.reply_text(
             f"Alert set for {ticker} at Rs. {target_price:.2f}."
@@ -184,47 +204,63 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = "Your Active Price Alerts:\n\n"
-    for ticker, price in alerts.items():
-        msg += f"- {ticker}: Rs. {price:.2f}\n"
+    for alert_id, ticker, price in alerts:
+        msg += f"ID {alert_id}: {ticker} -> Rs. {price:.2f}\n"
 
+    msg += "\nTo remove an alert, use /delete <ID> or /delete <TICKER>."
     await update.message.reply_text(msg)
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /delete <TICKER> or /delete ALL")
+        await update.message.reply_text(
+            "Usage: /delete <ID>, /delete <TICKER>, or /delete ALL"
+        )
         return
 
-    target = context.args[0].upper()
+    arg = context.args[0].upper()
 
-    if target == "ALL":
+    if arg == "ALL":
         clear_all_alerts_db()
         await update.message.reply_text("All active alerts cleared!")
         return
 
-    if not (target.endswith(".NS") or target.endswith(".BO")):
-        target += ".NS"
+    # Delete by numeric ID
+    if arg.isdigit():
+        alert_id = int(arg)
+        delete_alert_by_id(alert_id)
+        await update.message.reply_text(f"Alert ID {alert_id} deleted.")
+        return
 
-    alerts = get_all_alerts()
-    if target in alerts:
-        delete_alert_db(target)
-        await update.message.reply_text(f"Alert for {target} removed.")
-    else:
-        await update.message.reply_text(f"No active alert found for {target}.")
+    # Delete by ticker
+    ticker = arg
+    if not (ticker.endswith(".NS") or ticker.endswith(".BO")):
+        ticker += ".NS"
+
+    delete_alerts_by_ticker(ticker)
+    await update.message.reply_text(f"All alerts for {ticker} removed.")
 
 
 async def check_prices(context: ContextTypes.DEFAULT_TYPE):
-    # Load fresh active alerts from database
     alerts = get_all_alerts()
     if not alerts:
         return
 
-    tasks = [fetch_stock_price_async(ticker) for ticker in list(alerts.keys())]
+    # Extract unique tickers to query prices in parallel
+    unique_tickers = list({row[1] for row in alerts})
+
+    tasks = [fetch_stock_price_async(ticker) for ticker in unique_tickers]
     results = await asyncio.gather(*tasks)
 
-    for ticker, current_price in results:
-        if current_price is not None and ticker in alerts:
-            target_price = alerts[ticker]
+    # Convert results into a price dictionary: { "RELIANCE.NS": 2905.0 }
+    current_prices = {
+        ticker: price for ticker, price in results if price is not None
+    }
+
+    # Evaluate each active alert against current price
+    for alert_id, ticker, target_price in alerts:
+        if ticker in current_prices:
+            current_price = current_prices[ticker]
             if current_price >= target_price:
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
@@ -235,14 +271,12 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
                         f"Target Price: Rs. {target_price:.2f}"
                     ),
                 )
-                # Remove triggered alert from database
-                delete_alert_db(ticker)
+                # Remove triggered alert by ID from cloud database
+                delete_alert_by_id(alert_id)
 
 
 def main():
-    # Initialize SQLite database table
     init_db()
-
     keep_alive()
 
     bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -255,7 +289,7 @@ def main():
     job_queue = bot_app.job_queue
     job_queue.run_repeating(check_prices, interval=10, first=5)
 
-    print("Bot started with SQLite persistent storage...")
+    print("Bot started with SQLite Cloud storage and multi-alert support...")
     bot_app.run_polling()
 
 
