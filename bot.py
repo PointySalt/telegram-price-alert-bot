@@ -167,11 +167,11 @@ def is_valid_ticker_sync(ticker: str) -> bool:
 
 
 def get_indices_text() -> str:
-    """Helper to format Sensex, Nifty 50, and Nifty Midcap 150 current levels."""
+    """Helper to format Sensex, Nifty 50, and Nifty Midcap 150 levels."""
     indices = {
         "Nifty 50": "^NSEI",
         "Sensex": "^BSESN",
-        "Nifty Midcap 150": "NIFTY_MIDCAP_150.NS",
+        "Nifty Midcap 150": "MIDCAPETF.NS",
     }
 
     msg = "Market Indices Overview:\n\n"
@@ -475,4 +475,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
