@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]
 yfinance
 flask
 python-dotenv
+sqlitecloud
